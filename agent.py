@@ -3,7 +3,7 @@ from collections import deque
 import torch
 import pickle
 import numpy as np
-from learning import DQN, train_dqn, select_action as select_action_fn
+from learning import DQN, DuelingDQN, train_dqn, select_action as select_action_fn
 from replayMemory import ReplayMemory
 from config import (
     INPUT_SIZE,
@@ -30,10 +30,11 @@ class Agent:
     def __init__(self, input_dim, output_dim=OUTPUT_SIZE, k_frames=3):
         # Device configuration
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print("Using device: {}".format(self.device))
 
         # Networks
-        self.policy_net = DQN(input_dim, HIDDEN_SIZE, output_dim).to(self.device)
-        self.target_net = DQN(input_dim, HIDDEN_SIZE, output_dim).to(self.device)
+        self.policy_net = DuelingDQN(input_dim, HIDDEN_SIZE, output_dim).to(self.device)
+        self.target_net = DuelingDQN(input_dim, HIDDEN_SIZE, output_dim).to(self.device)
         self.update_target()
 
         # Optimizer
@@ -42,7 +43,7 @@ class Agent:
         )
 
         # Replay memory
-        self.memory = ReplayMemory(MEMORY_CAPACITY, min_terminal_samples=10)
+        self.memory = ReplayMemory(MEMORY_CAPACITY, min_terminal_samples=5)
 
         # Epsilon-greedy parameters
         self.epsilon = EPSILON_START
@@ -85,7 +86,7 @@ class Agent:
         self.state_buf.append(s1)
         next_stacked = self._stacked().detach().cpu()
 
-        if getattr(self, "_stack_debug", True):
+        if getattr(self, "_stack_debug", False):
             K = self.k
             feat = next_stacked.shape[1] // K
 
@@ -152,15 +153,19 @@ class Agent:
 
     def save(self, model_path: str, memory_path: str):
         """
-        Save the policy network weights to `model_path` and
-        overwrite the memory file at `memory_path`.
+        Save the policy network weights to `model_path`.
+
+        `memory_path` is kept for backward-compatible call sites. Replay memory
+        is large, so training saves it explicitly at snapshot intervals.
         """
-        # 1) Model
         torch.save(self.policy_net.state_dict(), model_path)
 
-        # 2) Memory (always the same file, so it gets replaced)
-        # with open(memory_path, "wb") as f:
-        #     pickle.dump(self.memory, f)
+    def save_memory(self, memory_path: str):
+        """
+        Persist replay memory separately from the model checkpoint.
+        """
+        with open(memory_path, "wb") as f:
+            pickle.dump(self.memory, f)
 
     def load(self, path: str):
         """

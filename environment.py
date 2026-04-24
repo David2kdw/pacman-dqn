@@ -103,6 +103,8 @@ class Environment:
         self.pacman_pos = list(self.pacman_start)
         self.pacman_dx = 0
         self.pacman_dy = 0
+        self.prev_pacman_dx = 0
+        self.prev_pacman_dy = 0
 
         self.enemies = [[ex, ey, dx, dy] for (ex, ey, dx, dy) in self.enemy_starts]
 
@@ -159,14 +161,14 @@ class Environment:
         Apply one time-step:
           - Move Pac-Man based on action (0=←,1=→,2=↑,3=↓).
           - Check for wall collision (revert if needed).
-          - Check for enemy collision → done flag.
-          - Compute reward via compute_reward().
           - Remove eaten dot if present.
+          - Check terminal events and compute reward.
           - Move each enemy one random valid step.
         Returns:
           next_state (torch.Tensor), reward (float), done (bool)
         """
         old_x, old_y = self.pacman_pos.copy()
+        prev_dx, prev_dy = self.pacman_dx, self.pacman_dy
 
         # 1. Move Pac-Man & record direction
         if action == 0:
@@ -183,19 +185,29 @@ class Environment:
         if any(r.colliderect(w) for w in self.walls):
             self.pacman_pos = [old_x, old_y]
 
-        # 3. Enemy collision → done
-        done = any((self.pacman_pos[0] == e[0] and self.pacman_pos[1] == e[1])
-                   for e in self.enemies)
-
-        # 4. Reward
-        reward = self.compute_reward(old_x, old_y,
-                                     self.pacman_pos[0], self.pacman_pos[1],
-                                     done)
-
-        # 5. Dot eaten?
+        # 3. Dot eaten?
         pos = tuple(self.pacman_pos)
+        ate_dot = pos in self.dots
         if pos in self.dots:
             self.dots.remove(pos)
+
+        # 4. Terminal event and reward
+        death = any((self.pacman_pos[0] == e[0] and self.pacman_pos[1] == e[1])
+                    for e in self.enemies)
+        cleared = len(self.dots) == 0
+        done = death or cleared
+        terminal_reason = "death" if death else "clear" if cleared else None
+        reward = self.compute_reward(old_x, old_y,
+                                     self.pacman_pos[0], self.pacman_pos[1],
+                                     done,
+                                     ate_dot=ate_dot,
+                                     terminal_reason=terminal_reason,
+                                     prev_dir=(prev_dx, prev_dy))
+
+        self.prev_pacman_dx, self.prev_pacman_dy = self.pacman_dx, self.pacman_dy
+
+        if done:
+            return self.get_state(), reward, done
 
         # 6. Move enemies (one random valid shift each)
         for enemy in self.enemies:
@@ -216,6 +228,9 @@ class Environment:
                 enemy[2], enemy[3] = -enemy[2], -enemy[3]
 
         # 7. New observation
+        if self._collision_with_enemy(self.pacman_pos[0], self.pacman_pos[1]):
+            return self.get_state(), float(R_DEATH), True
+
         next_state = self.get_state()
         return next_state, reward, done
 
@@ -320,7 +335,17 @@ class Environment:
                         q.append((nx, ny))
         return dist
 
-    def compute_reward(self, old_x, old_y, new_x, new_y, done: bool):
+    def compute_reward(
+        self,
+        old_x,
+        old_y,
+        new_x,
+        new_y,
+        done: bool,
+        ate_dot: bool = False,
+        terminal_reason: str | None = None,
+        prev_dir: tuple[int, int] | None = None,
+    ):
         """
         Reward = terminal event + per-step events + potential-based shaping.
         Distances in shaping are shortest-path grid distances (via BFS), not Manhattan.
@@ -328,10 +353,9 @@ class Environment:
         """
         # 1) Terminal events
         if done:
-            # Try to infer the termination cause for better feedback.
-            if len(self.dots) == 0:
+            if terminal_reason == "clear":
                 return float(R_CLEAR)
-            elif self._collision_with_enemy(new_x, new_y):
+            elif terminal_reason == "death" or self._collision_with_enemy(new_x, new_y):
                 return float(R_DEATH)
             else:
                 return float(R_TIMEOUT)
@@ -342,7 +366,7 @@ class Environment:
         r += LIVING_COST
 
         # Dot eaten (note: at this point env may not have removed the dot yet)
-        if (new_x, new_y) in self.dots:
+        if ate_dot or (new_x, new_y) in self.dots:
             r += R_DOT
 
         # Wall bump / no movement
@@ -352,8 +376,13 @@ class Environment:
         # Reverse direction penalty (reduces oscillation)
         ndx, ndy = new_x - old_x, new_y - old_y
         if (ndx, ndy) != (0, 0):
-            prev_dx = np.sign(getattr(self, "pacman_dx", 0))
-            prev_dy = np.sign(getattr(self, "pacman_dy", 0))
+            if prev_dir is None:
+                prev_dir = (
+                    getattr(self, "prev_pacman_dx", 0),
+                    getattr(self, "prev_pacman_dy", 0),
+                )
+            prev_dx = np.sign(prev_dir[0])
+            prev_dy = np.sign(prev_dir[1])
             cur_dx = np.sign(ndx)
             cur_dy = np.sign(ndy)
             if (prev_dx != 0 and cur_dx == -prev_dx) or (prev_dy != 0 and cur_dy == -prev_dy):

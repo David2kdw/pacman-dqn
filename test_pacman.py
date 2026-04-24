@@ -1,9 +1,15 @@
 import os
 import sys
 import argparse
+import time
 import pygame
 
-from config import CHECKPOINT_DIR, INPUT_SIZE   # ← 引入 INPUT_SIZE（堆叠后的输入维度）
+from config import (
+    CHECKPOINT_DIR,
+    INPUT_SIZE,
+    MAX_EPISODE_TIME,
+    MAX_STEPS_PER_EPISODE,
+)   # ← 引入 INPUT_SIZE（堆叠后的输入维度）
 from environment import Environment
 from renderer import Renderer
 from agent import Agent
@@ -24,6 +30,14 @@ def main():
     parser.add_argument(
         '--fps', type=int, default=30,
         help='Rendering frames per second (default: 30).'
+    )
+    parser.add_argument(
+        '--max-steps', type=int, default=MAX_STEPS_PER_EPISODE,
+        help=f'Maximum steps per test episode (default: {MAX_STEPS_PER_EPISODE}).'
+    )
+    parser.add_argument(
+        '--max-seconds', type=float, default=MAX_EPISODE_TIME,
+        help=f'Maximum wall-clock seconds per test episode (default: {MAX_EPISODE_TIME}).'
     )
     args = parser.parse_args()
 
@@ -52,10 +66,14 @@ def main():
         done = False
         total_reward = 0.0
         steps = 0
+        start_time = time.time()
+        end_reason = None
 
         renderer.render(env)
 
-        while not done:
+        while (not done
+               and steps < args.max_steps
+               and (time.time() - start_time) < args.max_seconds):
             # OS events
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
@@ -73,7 +91,13 @@ def main():
             renderer.render(env)
             renderer.clock.tick(args.fps)
 
-        print(f"[Test {ep}] Steps: {steps}, Total Reward: {total_reward:.2f}")
+        if not done:
+            end_reason = ('step limit reached'
+                          if steps >= args.max_steps
+                          else 'time limit reached')
+
+        reason_text = f", {end_reason}" if end_reason else ""
+        print(f"[Test {ep}] Steps: {steps}, Total Reward: {total_reward:.2f}{reason_text}")
 
     pygame.quit()
 

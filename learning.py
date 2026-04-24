@@ -33,6 +33,55 @@ class DQN(nn.Module):
         x = self.act4(self.fc4(x))
         return self.output_layer(x)
 
+class DuelingDQN(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size):
+        super().__init__()
+        # ---- 共享干路，与原来保持一致 ----
+        self.fc1 = nn.Linear(input_size, hidden_size)
+        self.act1 = nn.LeakyReLU(negative_slope=0.01)
+
+        self.fc2 = nn.Linear(hidden_size, hidden_size)
+        self.act2 = nn.LeakyReLU(negative_slope=0.01)
+
+        self.fc3 = nn.Linear(hidden_size, hidden_size)
+        self.act3 = nn.LeakyReLU(negative_slope=0.01)
+
+        self.fc4 = nn.Linear(hidden_size, hidden_size // 2)
+        self.act4 = nn.LeakyReLU(negative_slope=0.01)
+
+        # ---- Dueling 头：Value 与 Advantage ----
+        self.value_head = nn.Sequential(
+            nn.Linear(hidden_size // 2, hidden_size // 2),
+            nn.LeakyReLU(negative_slope=0.01),
+            nn.Linear(hidden_size // 2, 1)           # 标量 V(s)
+        )
+        self.adv_head = nn.Sequential(
+            nn.Linear(hidden_size // 2, hidden_size // 2),
+            nn.LeakyReLU(negative_slope=0.01),
+            nn.Linear(hidden_size // 2, output_size) # 各动作的 A(s,a)
+        )
+
+        # 小技巧：最后一层置 0，开局 Q≈0 更稳
+        nn.init.zeros_(self.value_head[-1].weight)
+        nn.init.zeros_(self.value_head[-1].bias)
+        nn.init.zeros_(self.adv_head[-1].weight)
+        nn.init.zeros_(self.adv_head[-1].bias)
+
+    def forward(self, x):
+        # Flatten to (batch, -1)
+        x = x.view(x.shape[0], -1)
+        x = self.act1(self.fc1(x))
+        x = self.act2(self.fc2(x))
+        x = self.act3(self.fc3(x))
+        x = self.act4(self.fc4(x))
+
+        V = self.value_head(x)                 # (B, 1)
+        A = self.adv_head(x)                   # (B, n_actions)
+        A = A - A.mean(dim=1, keepdim=True)    # mean 归一，解决不唯一性
+        Q = V + A                              # (B, n_actions)
+        return Q
+
+
 
     
 def train_dqn(
@@ -111,10 +160,10 @@ def train_dqn(
 
     if train_step % 100 == 0:
         import numpy as _np
-        last = slice(-25, None)
+        last = slice(-100, None)
         n_term = int(dones.sum().item())
         print(f"\n🔹 TRAINING UPDATE {train_step}")
-        print(f"   ✅ Average Loss (Last 25): {_np.mean(losses[last]):.5f}")
+        print(f"   ✅ Average Loss (Last 100): {_np.mean(losses[last]):.5f}")
         print(f"   ✅ Average Q: {_np.mean(q_value_logs[last]):.3f} "
               f"(Min: {_np.min(q_value_logs[last]):.3f}, Max: {_np.max(q_value_logs[last]):.3f})")
         print(f"   ✅ Termination Samples in batch: {n_term}")

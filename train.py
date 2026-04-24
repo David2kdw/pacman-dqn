@@ -13,6 +13,7 @@ from config import (
     MAX_EPISODE_TIME
 )
 from environment import Environment
+from environment import R_TIMEOUT
 from renderer import Renderer
 from agent import Agent
 import pygame, sys
@@ -28,8 +29,8 @@ def main():
     Main training loop with resume and checkpointing:
       - Resume from latest_model + metadata if present
       - Run episodes with optional step/time limits
-      - Save rolling latest_model + memory + metadata each episode
-      - Save full snapshots every 100 episodes
+      - Save rolling latest_model + metadata each episode
+      - Save replay memory and full snapshots every 100 episodes
     """
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
@@ -71,6 +72,7 @@ def main():
         total_reward = 0.0
         done = False
         step = 0
+        end_reason = None
         start_time = time.time()
         paused = False
         heatmap_cache = None
@@ -110,10 +112,21 @@ def main():
 
             action = agent.select_action()
             s, a, r, s_next, done = agent.step(env, action)
+            step += 1
+
+            if not done:
+                if step >= MAX_STEPS_PER_EPISODE:
+                    done = True
+                    end_reason = 'step limit reached'
+                    r += R_TIMEOUT
+                elif (time.time() - start_time) >= MAX_EPISODE_TIME:
+                    done = True
+                    end_reason = 'time limit reached'
+                    r += R_TIMEOUT
+
             agent.store_transition(s, a, r, s_next, done)
             agent.optimize_model()
             total_reward += r
-            step += 1
             state = s_next
 
             renderer.render(env, 
@@ -125,12 +138,9 @@ def main():
                 }
             )
 
-        # If episode didn't finish by goal, note the reason
-        if not done:
-            reason = ('step limit reached'
-                      if step >= MAX_STEPS_PER_EPISODE
-                      else 'time limit reached')
-            print(f"→ Episode {ep} ended early ({reason})")
+        # If episode finished by cap, the final transition was stored as terminal.
+        if end_reason is not None:
+            print(f"→ Episode {ep} ended early ({end_reason})")
         
 
         # Episode-end updates
@@ -143,7 +153,7 @@ def main():
               f" | Reward: {total_reward:.2f}"
               f" | Epsilon: {agent.epsilon:.3f}")
 
-        # Save latest model, memory, and metadata
+        # Save latest model and metadata.
         agent.save(LATEST_MODEL, MEMORY_PATH)
         with open(LATEST_META, 'w') as meta_file:
             json.dump({'episode': ep, 'epsilon': agent.epsilon}, meta_file)
@@ -151,8 +161,7 @@ def main():
         # Full snapshot every 100 episodes
         if ep % 100 == 0:
             agent.save(FULL_TEMPLATE.format(ep=ep), MEMORY_PATH)
-            with open(MEMORY_PATH, "wb") as f:
-                pickle.dump(agent.memory, f)
+            agent.save_memory(MEMORY_PATH)
         
 
     print("Training complete.")
