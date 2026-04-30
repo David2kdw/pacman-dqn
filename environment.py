@@ -13,12 +13,19 @@ R_CLEAR = +25.0  # all dots cleared
 R_TIMEOUT = -1.0  # episode ended by time/step limit
 R_DOT = +1.0  # eat a dot
 LIVING_COST = -0.01  # per-step cost
-WALL_BUMP = -0.20  # bump into a wall (no movement)
+WALL_BUMP = -1.0  # bump into a wall (no movement)
 BACKTRACK = -0.05  # reverse direction (helps reduce oscillation)
 GAMMA_SHAPING = 0.99  # discount factor used in potential-based shaping
 LAMBDA_DOT = 0.10  # weight for dot shaping
 LAMBDA_ENEMY = 0.06  # weight for enemy shaping
 ADJ_ENEMY_PEN = -2  # small penalty when adjacent to an enemy (optional)
+
+ACTION_DELTAS = {
+    0: (-GRID_SIZE, 0),
+    1: (GRID_SIZE, 0),
+    2: (0, -GRID_SIZE),
+    3: (0, GRID_SIZE),
+}
 
 
 
@@ -105,10 +112,30 @@ class Environment:
         self.pacman_dy = 0
         self.prev_pacman_dx = 0
         self.prev_pacman_dy = 0
+        self.last_event = {
+            "wall_bump": False,
+            "ate_dot": False,
+            "terminal_reason": None,
+        }
 
         self.enemies = [[ex, ey, dx, dy] for (ex, ey, dx, dy) in self.enemy_starts]
 
         return self.get_state()
+
+    def _pixel_hits_wall(self, x, y):
+        r = pygame.Rect(x, y, GRID_SIZE, GRID_SIZE)
+        return any(r.colliderect(w) for w in self.walls)
+
+    def valid_actions(self):
+        """
+        Return actions that keep Pac-Man inside walkable cells.
+        """
+        actions = []
+        x, y = self.pacman_pos
+        for action, (dx, dy) in ACTION_DELTAS.items():
+            if not self._pixel_hits_wall(x + dx, y + dy):
+                actions.append(action)
+        return actions or list(ACTION_DELTAS)
 
     def _is_walkable(self, gx, gy):
         if gx < 0 or gy < 0 or gx >= self.grid_w or gy >= self.grid_h:
@@ -169,27 +196,30 @@ class Environment:
         """
         old_x, old_y = self.pacman_pos.copy()
         prev_dx, prev_dy = self.pacman_dx, self.pacman_dy
+        self.last_event = {
+            "wall_bump": False,
+            "ate_dot": False,
+            "terminal_reason": None,
+        }
 
         # 1. Move Pac-Man & record direction
-        if action == 0:
-            self.pacman_pos[0] -= GRID_SIZE; self.pacman_dx, self.pacman_dy = -1, 0
-        elif action == 1:
-            self.pacman_pos[0] += GRID_SIZE; self.pacman_dx, self.pacman_dy =  1, 0
-        elif action == 2:
-            self.pacman_pos[1] -= GRID_SIZE; self.pacman_dx, self.pacman_dy =  0, -1
-        elif action == 3:
-            self.pacman_pos[1] += GRID_SIZE; self.pacman_dx, self.pacman_dy =  0,  1
+        dx, dy = ACTION_DELTAS.get(action, (0, 0))
+        self.pacman_pos[0] += dx
+        self.pacman_pos[1] += dy
+        self.pacman_dx, self.pacman_dy = np.sign(dx).item(), np.sign(dy).item()
 
         # 2. Wall collision?
-        r = pygame.Rect(self.pacman_pos[0], self.pacman_pos[1], GRID_SIZE, GRID_SIZE)
-        if any(r.colliderect(w) for w in self.walls):
+        wall_bump = self._pixel_hits_wall(self.pacman_pos[0], self.pacman_pos[1])
+        if wall_bump:
             self.pacman_pos = [old_x, old_y]
+            self.last_event["wall_bump"] = True
 
         # 3. Dot eaten?
         pos = tuple(self.pacman_pos)
         ate_dot = pos in self.dots
         if pos in self.dots:
             self.dots.remove(pos)
+        self.last_event["ate_dot"] = ate_dot
 
         # 4. Terminal event and reward
         death = any((self.pacman_pos[0] == e[0] and self.pacman_pos[1] == e[1])
@@ -197,12 +227,14 @@ class Environment:
         cleared = len(self.dots) == 0
         done = death or cleared
         terminal_reason = "death" if death else "clear" if cleared else None
+        self.last_event["terminal_reason"] = terminal_reason
         reward = self.compute_reward(old_x, old_y,
                                      self.pacman_pos[0], self.pacman_pos[1],
                                      done,
                                      ate_dot=ate_dot,
                                      terminal_reason=terminal_reason,
-                                     prev_dir=(prev_dx, prev_dy))
+                                     prev_dir=(prev_dx, prev_dy),
+                                     wall_bump=wall_bump)
 
         self.prev_pacman_dx, self.prev_pacman_dy = self.pacman_dx, self.pacman_dy
 
@@ -229,6 +261,7 @@ class Environment:
 
         # 7. New observation
         if self._collision_with_enemy(self.pacman_pos[0], self.pacman_pos[1]):
+            self.last_event["terminal_reason"] = "death"
             return self.get_state(), float(R_DEATH), True
 
         next_state = self.get_state()
@@ -345,6 +378,7 @@ class Environment:
         ate_dot: bool = False,
         terminal_reason: str | None = None,
         prev_dir: tuple[int, int] | None = None,
+        wall_bump: bool = False,
     ):
         """
         Reward = terminal event + per-step events + potential-based shaping.
@@ -370,7 +404,7 @@ class Environment:
             r += R_DOT
 
         # Wall bump / no movement
-        if (new_x, new_y) == (old_x, old_y):
+        if wall_bump or (new_x, new_y) == (old_x, old_y):
             r += WALL_BUMP
 
         # Reverse direction penalty (reduces oscillation)

@@ -39,6 +39,10 @@ def main():
         '--max-seconds', type=float, default=MAX_EPISODE_TIME,
         help=f'Maximum wall-clock seconds per test episode (default: {MAX_EPISODE_TIME}).'
     )
+    parser.add_argument(
+        '--mask-actions', action='store_true',
+        help='Restrict the policy to legal non-wall actions during evaluation.'
+    )
     args = parser.parse_args()
 
     # Determine checkpoint to load: argument or latest_model.pth
@@ -80,7 +84,8 @@ def main():
                     pygame.quit()
                     sys.exit()
 
-            action = agent.select_action(state)
+            valid_actions = env.valid_actions() if args.mask_actions else None
+            action = agent.select_action(state, valid_actions=valid_actions)
 
             s_t, a, r, s_next, done = agent.step(env, action)
 

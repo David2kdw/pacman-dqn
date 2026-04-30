@@ -16,7 +16,7 @@ class ReplayMemory:
           they can be sampled at least once (standard PER practice).
         * Terminal-enforcement is optional via `min_terminal_samples` at init-time
           (set None to disable). This is domain-agnostic and simply relies on the
-          `done` flag stored with each transition.
+          `done` flag stored as the final transition field.
     """
     def __init__(
         self,
@@ -55,13 +55,23 @@ class ReplayMemory:
         reward: float,
         next_state: torch.Tensor,
         done: bool,
+        next_valid_actions: Optional[Sequence[int]] = None,
         priority_override: Optional[float] = None,
     ) -> None:
         """
         Insert a transition. If `priority_override` is None, the new item will receive
         the current maximum priority (or 1.0 if buffer is empty).
         """
-        self.storage[self.next_idx] = (state, action, reward, next_state, done)
+        if next_valid_actions is not None:
+            next_valid_actions = tuple(int(a) for a in next_valid_actions)
+        self.storage[self.next_idx] = (
+            state,
+            action,
+            reward,
+            next_state,
+            next_valid_actions,
+            done,
+        )
 
         if priority_override is None:
             max_pr = self.priorities[:self.size].max() if self.size > 0 else 1.0
@@ -103,7 +113,9 @@ class ReplayMemory:
                   (beta=0 -> no correction; beta=1 -> full correction)
 
         Returns:
-            samples: list of transitions (state, action, reward, next_state, done)
+            samples: list of transitions. New samples are
+              (state, action, reward, next_state, next_valid_actions, done).
+              Older 5-field samples remain supported by the learner.
             indices: numpy array of absolute indices in the buffer
             weights: torch tensor of importance-sampling weights (shape [batch])
         """

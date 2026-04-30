@@ -110,11 +110,14 @@ class Agent:
 
     def store_transition(self, *args):
         """
-        Save a transition (state, action, reward, next_state, done) into replay memory.
+        Save a transition into replay memory.
+
+        New transitions include next_valid_actions so target computation can
+        ignore impossible wall-collision actions.
         """
         self.memory.push(*args)
 
-    def select_action(self, state=None):
+    def select_action(self, state=None, valid_actions=None):
         """
         Choose an action using epsilon-greedy policy.
 
@@ -128,7 +131,7 @@ class Agent:
         state = state.to(self.device)
 
         eps = self.epsilon
-        action = select_action_fn(self.policy_net, state.to(self.device), eps)
+        action = select_action_fn(self.policy_net, state.to(self.device), eps, valid_actions)
         self.steps_done += 1
         return action
 
