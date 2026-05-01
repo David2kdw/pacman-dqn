@@ -40,8 +40,70 @@ BATCH_SIZE = 50
 EPSILON_START = 1.0
 EPSILON_DECAY = 0.9995
 EPSILON_MIN = 0.1
-ACTION_MASK_UNTIL_EPISODE = 1000
 VISUALIZE_TRAINING = False
+
+REWARD_PROFILES = {
+    "baseline": {
+        "R_DEATH": -15.0,
+        "R_CLEAR": 25.0,
+        "R_TIMEOUT": -1.0,
+        "R_DOT": 1.0,
+        "LIVING_COST": -0.01,
+        "WALL_BUMP": -1.0,
+        "GAMMA_SHAPING": 0.99,
+        "LAMBDA_DOT": 0.10,
+        "LAMBDA_ENEMY": 0.06,
+        "ADJ_ENEMY_PEN": -2.0,
+    },
+    "eat_focused": {
+        "R_DEATH": -15.0,
+        "R_CLEAR": 25.0,
+        "R_TIMEOUT": -1.0,
+        "R_DOT": 1.3,
+        "LIVING_COST": -0.003,
+        "WALL_BUMP": -1.0,
+        "GAMMA_SHAPING": 0.99,
+        "LAMBDA_DOT": 0.06,
+        "LAMBDA_ENEMY": 0.06,
+        "ADJ_ENEMY_PEN": -2.0,
+    },
+    "wall_focused": {
+        "R_DEATH": -15.0,
+        "R_CLEAR": 25.0,
+        "R_TIMEOUT": -1.0,
+        "R_DOT": 1.0,
+        "LIVING_COST": -0.003,
+        "WALL_BUMP": -1.5,
+        "GAMMA_SHAPING": 0.99,
+        "LAMBDA_DOT": 0.06,
+        "LAMBDA_ENEMY": 0.06,
+        "ADJ_ENEMY_PEN": -2.0,
+    },
+    "survival_focused": {
+        "R_DEATH": -25.0,
+        "R_CLEAR": 25.0,
+        "R_TIMEOUT": -1.0,
+        "R_DOT": 1.0,
+        "LIVING_COST": -0.002,
+        "WALL_BUMP": -1.0,
+        "GAMMA_SHAPING": 0.99,
+        "LAMBDA_DOT": 0.05,
+        "LAMBDA_ENEMY": 0.10,
+        "ADJ_ENEMY_PEN": -3.0,
+    },
+    "balanced": {
+        "R_DEATH": -20.0,
+        "R_CLEAR": 25.0,
+        "R_TIMEOUT": -1.0,
+        "R_DOT": 1.2,
+        "LIVING_COST": -0.003,
+        "WALL_BUMP": -1.2,
+        "GAMMA_SHAPING": 0.99,
+        "LAMBDA_DOT": 0.06,
+        "LAMBDA_ENEMY": 0.08,
+        "ADJ_ENEMY_PEN": -2.5,
+    },
+}
 
 CHECKPOINT_DIR = "checkpoints/"
 MEMORY_PATH = "checkpoints/memory.pkl"
@@ -57,5 +119,11 @@ MAX_STEPS_PER_EPISODE = 1000
 MAX_EPISODE_TIME = 30
 
 K_FRAMES = 3
-BASE_FEAT_DIM = len(MAZE.splitlines()[0]) * len(MAZE.splitlines()) + 4
+STATE_GRID_CHANNELS = 4
+STATE_EXTRA_FEATURES = 10
+BASE_FEAT_DIM = (
+    len(MAZE.splitlines()[0]) * len(MAZE.splitlines()) * STATE_GRID_CHANNELS
+    + 4
+    + STATE_EXTRA_FEATURES
+)
 INPUT_SIZE = BASE_FEAT_DIM * K_FRAMES

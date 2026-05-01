@@ -10,55 +10,27 @@ q_value_logs = []  # Store Q-value history
 
 def _unpack_transition_batch(batch):
     """
-    Support both legacy 5-field replay items and current 6-field items.
-    Current format: (state, action, reward, next_state, next_valid_actions, done).
+    Support both normal 5-field replay items and older 6-field items.
+    Any stored legacy metadata is ignored.
     """
     states = []
     actions = []
     rewards = []
     next_states = []
-    next_valid_actions = []
     dones = []
 
-    has_action_masks = False
     for item in batch:
         if len(item) == 6:
-            s, a, r, s_next, valid_actions, done = item
-            has_action_masks = has_action_masks or valid_actions is not None
+            s, a, r, s_next, _ignored_metadata, done = item
         else:
             s, a, r, s_next, done = item
-            valid_actions = None
         states.append(s)
         actions.append(a)
         rewards.append(r)
         next_states.append(s_next)
-        next_valid_actions.append(valid_actions)
         dones.append(done)
 
-    if not has_action_masks:
-        next_valid_actions = None
-    return states, actions, rewards, next_states, next_valid_actions, dones
-
-
-def _mask_invalid_actions(q_values, valid_actions_batch):
-    """
-    Mask invalid action columns per row before argmax target selection.
-    Rows with no valid-action metadata are left unchanged for legacy samples.
-    """
-    if valid_actions_batch is None:
-        return q_values
-
-    masked = q_values.clone()
-    for row, valid_actions in enumerate(valid_actions_batch):
-        if valid_actions is None:
-            continue
-        valid_actions = list(valid_actions)
-        if not valid_actions:
-            continue
-        row_mask = torch.full_like(masked[row], float("-inf"))
-        row_mask[valid_actions] = masked[row, valid_actions]
-        masked[row] = row_mask
-    return masked
+    return states, actions, rewards, next_states, dones
 
 class DQN(nn.Module):
     def __init__(self, input_size, hidden_size, output_size):
@@ -163,7 +135,7 @@ def train_dqn(
 
     # 2) Sample from replay
     batch, indices, weights = memory.sample(batch_size, beta=beta)
-    states, actions, rewards, next_states, next_valid_actions, dones = _unpack_transition_batch(batch)
+    states, actions, rewards, next_states, dones = _unpack_transition_batch(batch)
 
     states = torch.cat(states, dim=0)
     next_states = torch.cat(next_states, dim=0)
@@ -184,9 +156,7 @@ def train_dqn(
     with torch.no_grad():
         online_model.eval()
         target_model.eval()
-        next_online_q = online_model(next_states)
-        next_online_q = _mask_invalid_actions(next_online_q, next_valid_actions)
-        next_actions = next_online_q.argmax(dim=1, keepdim=True)
+        next_actions = online_model(next_states).argmax(dim=1, keepdim=True)
         next_target_q = target_model(next_states).gather(1, next_actions).squeeze(1)
         target_q_values = rewards + gamma * next_target_q * (~dones)
     online_model.train(online_mode)
@@ -235,15 +205,8 @@ def train_dqn(
                   f"T={target_q_values[idx].item():.3f}")
         print('-' * 50)
 
-def select_action(model, state, epsilon, valid_actions=None):
-    if valid_actions is not None:
-        valid_actions = list(valid_actions)
-        if not valid_actions:
-            valid_actions = None
-
+def select_action(model, state, epsilon):
     if random.random() < epsilon:
-        if valid_actions is not None:
-            return random.choice(valid_actions)
         return random.randint(0, 3)
     else:
         with torch.no_grad():
@@ -251,10 +214,6 @@ def select_action(model, state, epsilon, valid_actions=None):
             if state.dim() == 1:
                 state = state.unsqueeze(0)
             q_values = model(state)
-            if valid_actions is not None:
-                mask = torch.full_like(q_values, float("-inf"))
-                mask[:, valid_actions] = q_values[:, valid_actions]
-                q_values = mask
             model.train()
             return q_values.argmax(dim=1).item()
 

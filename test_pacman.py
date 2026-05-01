@@ -9,6 +9,7 @@ from config import (
     INPUT_SIZE,
     MAX_EPISODE_TIME,
     MAX_STEPS_PER_EPISODE,
+    REWARD_PROFILES,
 )   # ← 引入 INPUT_SIZE（堆叠后的输入维度）
 from environment import Environment
 from renderer import Renderer
@@ -40,8 +41,8 @@ def main():
         help=f'Maximum wall-clock seconds per test episode (default: {MAX_EPISODE_TIME}).'
     )
     parser.add_argument(
-        '--mask-actions', action='store_true',
-        help='Restrict the policy to legal non-wall actions during evaluation.'
+        '--reward-profile', choices=sorted(REWARD_PROFILES), default='baseline',
+        help='Reward profile to use in the test environment.'
     )
     args = parser.parse_args()
 
@@ -52,7 +53,7 @@ def main():
         sys.exit(1)
 
     # Initialize environment, agent, renderer
-    env = Environment()
+    env = Environment(reward_config=args.reward_profile)
 
     # 关键：用堆叠后的 INPUT_SIZE 初始化 Agent（不要用 env.get_state() 的单帧维度）
     agent = Agent(input_dim=INPUT_SIZE)
@@ -84,8 +85,7 @@ def main():
                     pygame.quit()
                     sys.exit()
 
-            valid_actions = env.valid_actions() if args.mask_actions else None
-            action = agent.select_action(state, valid_actions=valid_actions)
+            action = agent.select_action(state)
 
             s_t, a, r, s_next, done = agent.step(env, action)
 

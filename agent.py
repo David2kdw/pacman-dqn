@@ -112,12 +112,10 @@ class Agent:
         """
         Save a transition into replay memory.
 
-        New transitions include next_valid_actions so target computation can
-        ignore impossible wall-collision actions.
         """
         self.memory.push(*args)
 
-    def select_action(self, state=None, valid_actions=None):
+    def select_action(self, state=None):
         """
         Choose an action using epsilon-greedy policy.
 
@@ -131,7 +129,7 @@ class Agent:
         state = state.to(self.device)
 
         eps = self.epsilon
-        action = select_action_fn(self.policy_net, state.to(self.device), eps, valid_actions)
+        action = select_action_fn(self.policy_net, state.to(self.device), eps)
         self.steps_done += 1
         return action
 
@@ -177,7 +175,14 @@ class Agent:
         Args:
             path (str): filepath to load the model from
         """
-        self.policy_net.load_state_dict(torch.load(path))
+        try:
+            self.policy_net.load_state_dict(torch.load(path))
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "Failed to load checkpoint. The model architecture or INPUT_SIZE "
+                "does not match the current state encoder; train a fresh checkpoint "
+                "or use the code version that created this checkpoint."
+            ) from exc
         self.update_target()
 
     @torch.no_grad()

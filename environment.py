@@ -1,24 +1,28 @@
 from collections import deque
+from dataclasses import dataclass
 
 import pygame
 import random
 import numpy as np
 import torch
 from copy import deepcopy
-from config import MAZE, GRID_SIZE, WALL_VAL, DOT_VAL, ENEMY_VAL, EMPTY_VAL, PACMAN_VAL
+from config import (
+    MAZE,
+    GRID_SIZE,
+    REWARD_PROFILES,
+)
 
 # ====== Tunable rewards / shaping weights ======
-R_DEATH = -15.0  # collision with an enemy
-R_CLEAR = +25.0  # all dots cleared
-R_TIMEOUT = -1.0  # episode ended by time/step limit
-R_DOT = +1.0  # eat a dot
-LIVING_COST = -0.01  # per-step cost
-WALL_BUMP = -1.0  # bump into a wall (no movement)
-BACKTRACK = -0.05  # reverse direction (helps reduce oscillation)
-GAMMA_SHAPING = 0.99  # discount factor used in potential-based shaping
-LAMBDA_DOT = 0.10  # weight for dot shaping
-LAMBDA_ENEMY = 0.06  # weight for enemy shaping
-ADJ_ENEMY_PEN = -2  # small penalty when adjacent to an enemy (optional)
+R_DEATH = REWARD_PROFILES["baseline"]["R_DEATH"]  # collision with an enemy
+R_CLEAR = REWARD_PROFILES["baseline"]["R_CLEAR"]  # all dots cleared
+R_TIMEOUT = REWARD_PROFILES["baseline"]["R_TIMEOUT"]  # episode ended by time/step limit
+R_DOT = REWARD_PROFILES["baseline"]["R_DOT"]  # eat a dot
+LIVING_COST = REWARD_PROFILES["baseline"]["LIVING_COST"]  # per-step cost
+WALL_BUMP = REWARD_PROFILES["baseline"]["WALL_BUMP"]  # bump into a wall
+GAMMA_SHAPING = REWARD_PROFILES["baseline"]["GAMMA_SHAPING"]
+LAMBDA_DOT = REWARD_PROFILES["baseline"]["LAMBDA_DOT"]  # dot shaping weight
+LAMBDA_ENEMY = REWARD_PROFILES["baseline"]["LAMBDA_ENEMY"]  # enemy shaping weight
+ADJ_ENEMY_PEN = REWARD_PROFILES["baseline"]["ADJ_ENEMY_PEN"]
 
 ACTION_DELTAS = {
     0: (-GRID_SIZE, 0),
@@ -28,6 +32,39 @@ ACTION_DELTAS = {
 }
 
 
+@dataclass(frozen=True)
+class RewardConfig:
+    R_DEATH: float = R_DEATH
+    R_CLEAR: float = R_CLEAR
+    R_TIMEOUT: float = R_TIMEOUT
+    R_DOT: float = R_DOT
+    LIVING_COST: float = LIVING_COST
+    WALL_BUMP: float = WALL_BUMP
+    GAMMA_SHAPING: float = GAMMA_SHAPING
+    LAMBDA_DOT: float = LAMBDA_DOT
+    LAMBDA_ENEMY: float = LAMBDA_ENEMY
+    ADJ_ENEMY_PEN: float = ADJ_ENEMY_PEN
+
+    @classmethod
+    def from_profile(cls, profile_name: str) -> "RewardConfig":
+        if profile_name not in REWARD_PROFILES:
+            choices = ", ".join(sorted(REWARD_PROFILES))
+            raise ValueError(f"Unknown reward profile '{profile_name}'. Choices: {choices}")
+        return cls(**REWARD_PROFILES[profile_name])
+
+
+def make_reward_config(reward_config=None) -> RewardConfig:
+    if reward_config is None:
+        return RewardConfig.from_profile("baseline")
+    if isinstance(reward_config, RewardConfig):
+        return reward_config
+    if isinstance(reward_config, str):
+        return RewardConfig.from_profile(reward_config)
+    if isinstance(reward_config, dict):
+        return RewardConfig(**reward_config)
+    raise TypeError("reward_config must be None, str, dict, or RewardConfig")
+
+
 
 class Environment:
     """
@@ -35,12 +72,13 @@ class Environment:
     Encapsulates maze layout, entity positions, state encoding, and reward logic.
     """
 
-    def __init__(self):
+    def __init__(self, reward_config=None):
         """
         Build the static maze and record initial dot locations.
         Fix Pac-Man and enemy spawn points (center + four corners).
         Finally, call reset() to initialize the episode state.
         """
+        self.reward_config = make_reward_config(reward_config)
         self.maze = MAZE.splitlines()
         self.grid_w = len(self.maze[0])
         self.grid_h = len(self.maze)
@@ -110,8 +148,6 @@ class Environment:
         self.pacman_pos = list(self.pacman_start)
         self.pacman_dx = 0
         self.pacman_dy = 0
-        self.prev_pacman_dx = 0
-        self.prev_pacman_dy = 0
         self.last_event = {
             "wall_bump": False,
             "ate_dot": False,
@@ -125,17 +161,6 @@ class Environment:
     def _pixel_hits_wall(self, x, y):
         r = pygame.Rect(x, y, GRID_SIZE, GRID_SIZE)
         return any(r.colliderect(w) for w in self.walls)
-
-    def valid_actions(self):
-        """
-        Return actions that keep Pac-Man inside walkable cells.
-        """
-        actions = []
-        x, y = self.pacman_pos
-        for action, (dx, dy) in ACTION_DELTAS.items():
-            if not self._pixel_hits_wall(x + dx, y + dy):
-                actions.append(action)
-        return actions or list(ACTION_DELTAS)
 
     def _is_walkable(self, gx, gy):
         if gx < 0 or gy < 0 or gx >= self.grid_w or gy >= self.grid_h:
@@ -195,7 +220,6 @@ class Environment:
           next_state (torch.Tensor), reward (float), done (bool)
         """
         old_x, old_y = self.pacman_pos.copy()
-        prev_dx, prev_dy = self.pacman_dx, self.pacman_dy
         self.last_event = {
             "wall_bump": False,
             "ate_dot": False,
@@ -233,10 +257,7 @@ class Environment:
                                      done,
                                      ate_dot=ate_dot,
                                      terminal_reason=terminal_reason,
-                                     prev_dir=(prev_dx, prev_dy),
                                      wall_bump=wall_bump)
-
-        self.prev_pacman_dx, self.prev_pacman_dy = self.pacman_dx, self.pacman_dy
 
         if done:
             return self.get_state(), reward, done
@@ -262,7 +283,7 @@ class Environment:
         # 7. New observation
         if self._collision_with_enemy(self.pacman_pos[0], self.pacman_pos[1]):
             self.last_event["terminal_reason"] = "death"
-            return self.get_state(), float(R_DEATH), True
+            return self.get_state(), float(self.reward_config.R_DEATH), True
 
         next_state = self.get_state()
         return next_state, reward, done
@@ -270,15 +291,17 @@ class Environment:
     def get_state(self):
         """
         Encode the current maze + entities into a tensor:
-          - A flattened grid of size (W×H) with values
-            WALL_VAL, DOT_VAL, ENEMY_VAL, EMPTY_VAL, PACMAN_VAL
-            :contentReference[oaicite:0]{index=0}
+          - Four flattened binary grid channels: walls, dots, enemies, Pac-Man.
           - A 4-element one-hot of Pac-Man’s direction.
+          - Handcrafted nearest-dot and nearest-enemy relative features.
         Returns:
-          torch.Tensor shape [1, W×H + 4]
+          torch.Tensor shape [1, BASE_FEAT_DIM]
         """
         gw, gh = self.width // GRID_SIZE, self.height // GRID_SIZE
-        grid = np.zeros((gw, gh), dtype=float)
+        walls = np.zeros((gw, gh), dtype=np.float32)
+        dots = np.zeros((gw, gh), dtype=np.float32)
+        enemies = np.zeros((gw, gh), dtype=np.float32)
+        pacman = np.zeros((gw, gh), dtype=np.float32)
 
         # walls
         for w in self.walls:
@@ -286,26 +309,29 @@ class Environment:
             xe, ye = (w.x+w.width)//GRID_SIZE, (w.y+w.height)//GRID_SIZE
             for x in range(xs, xe):
                 for y in range(ys, ye):
-                    grid[x, y] = WALL_VAL
+                    walls[x, y] = 1.0
 
         # dots
         for x, y in self.dots:
             gx, gy = x//GRID_SIZE, y//GRID_SIZE
-            if grid[gx, gy] == EMPTY_VAL:
-                grid[gx, gy] = DOT_VAL
+            dots[gx, gy] = 1.0
 
         # enemies
         for ex, ey, _, _ in self.enemies:
             gx, gy = ex//GRID_SIZE, ey//GRID_SIZE
-            if 0 <= gx < gw and 0 <= gy < gh and grid[gx, gy] in (EMPTY_VAL, DOT_VAL):
-                grid[gx, gy] = ENEMY_VAL
+            if 0 <= gx < gw and 0 <= gy < gh:
+                enemies[gx, gy] = 1.0
 
         # Pac-Man
         px, py = self.pacman_pos[0]//GRID_SIZE, self.pacman_pos[1]//GRID_SIZE
-        grid[px, py] = PACMAN_VAL
+        pacman[px, py] = 1.0
 
-        # to tensor
-        t_grid = torch.tensor(grid.flatten(), dtype=torch.float32).unsqueeze(0)
+        grid_features = np.concatenate([
+            walls.flatten(),
+            dots.flatten(),
+            enemies.flatten(),
+            pacman.flatten(),
+        ]).astype(np.float32)
 
         # direction one-hot
         dir_oh = [0,0,0,0]
@@ -313,9 +339,60 @@ class Environment:
         elif self.pacman_dx ==  1: dir_oh[1]=1
         elif self.pacman_dy == -1: dir_oh[2]=1
         elif self.pacman_dy ==  1: dir_oh[3]=1
-        t_dir = torch.tensor([dir_oh], dtype=torch.float32)
 
-        return torch.cat((t_grid, t_dir), dim=1)
+        extra = self._nearest_entity_features()
+        features = np.concatenate([
+            grid_features,
+            np.asarray(dir_oh, dtype=np.float32),
+            extra,
+        ]).astype(np.float32)
+        return torch.tensor(features, dtype=torch.float32).unsqueeze(0)
+
+    def _nearest_entity_features(self):
+        """
+        Return normalized features for nearest dot and enemy:
+        [dot_dx, dot_dy, dot_grid_dist, dot_exists, dot_adjacent,
+         enemy_dx, enemy_dy, enemy_grid_dist, enemy_exists, enemy_adjacent]
+        """
+        px, py = self._grid_coords(self.pacman_pos[0], self.pacman_pos[1])
+        max_dim = max(self.grid_w, self.grid_h)
+        max_dist = max(1, self.grid_w * self.grid_h)
+
+        dot_features = self._nearest_features_to_targets(
+            px, py, self._dot_cells(), max_dim, max_dist
+        )
+        enemy_features = self._nearest_features_to_targets(
+            px, py, self._enemy_cells(), max_dim, max_dist
+        )
+        return np.asarray(dot_features + enemy_features, dtype=np.float32)
+
+    def _nearest_features_to_targets(self, px, py, targets, max_dim, max_dist):
+        if not targets:
+            return [0.0, 0.0, 1.0, 0.0, 0.0]
+
+        dist_to_targets = self._grid_distance_to_set(targets)
+        if not np.isfinite(dist_to_targets[py, px]):
+            return [0.0, 0.0, 1.0, 0.0, 0.0]
+
+        dist_from_pacman = self._grid_distance_to_set({(px, py)})
+        best = None
+        best_dist = np.inf
+        for tx, ty in targets:
+            if 0 <= tx < self.grid_w and 0 <= ty < self.grid_h:
+                d = dist_from_pacman[ty, tx]
+                if np.isfinite(d) and d < best_dist:
+                    best = (tx, ty)
+                    best_dist = d
+
+        if best is None:
+            return [0.0, 0.0, 1.0, 0.0, 0.0]
+
+        tx, ty = best
+        dx = (tx - px) / max_dim
+        dy = (ty - py) / max_dim
+        grid_dist = min(best_dist / max_dist, 1.0)
+        adjacent = 1.0 if best_dist <= 1 else 0.0
+        return [float(dx), float(dy), float(grid_dist), 1.0, adjacent]
 
 
     # -----------------------------------------------
@@ -377,7 +454,6 @@ class Environment:
         done: bool,
         ate_dot: bool = False,
         terminal_reason: str | None = None,
-        prev_dir: tuple[int, int] | None = None,
         wall_bump: bool = False,
     ):
         """
@@ -385,45 +461,32 @@ class Environment:
         Distances in shaping are shortest-path grid distances (via BFS), not Manhattan.
         Positions passed in are pixel coordinates; they are converted to grid cells.
         """
+        cfg = self.reward_config
+
         # 1) Terminal events
         if done:
             if terminal_reason == "clear":
-                return float(R_CLEAR)
+                return float(cfg.R_CLEAR)
             elif terminal_reason == "death" or self._collision_with_enemy(new_x, new_y):
-                return float(R_DEATH)
+                return float(cfg.R_DEATH)
             else:
-                return float(R_TIMEOUT)
+                return float(cfg.R_TIMEOUT)
 
         r = 0.0
 
         # 2) Instantaneous events
-        r += LIVING_COST
+        r += cfg.LIVING_COST
 
         # Dot eaten (note: at this point env may not have removed the dot yet)
         if ate_dot or (new_x, new_y) in self.dots:
-            r += R_DOT
+            r += cfg.R_DOT
 
         # Wall bump / no movement
         if wall_bump or (new_x, new_y) == (old_x, old_y):
-            r += WALL_BUMP
-
-        # Reverse direction penalty (reduces oscillation)
-        ndx, ndy = new_x - old_x, new_y - old_y
-        if (ndx, ndy) != (0, 0):
-            if prev_dir is None:
-                prev_dir = (
-                    getattr(self, "prev_pacman_dx", 0),
-                    getattr(self, "prev_pacman_dy", 0),
-                )
-            prev_dx = np.sign(prev_dir[0])
-            prev_dy = np.sign(prev_dir[1])
-            cur_dx = np.sign(ndx)
-            cur_dy = np.sign(ndy)
-            if (prev_dx != 0 and cur_dx == -prev_dx) or (prev_dy != 0 and cur_dy == -prev_dy):
-                r += BACKTRACK
+            r += cfg.WALL_BUMP
 
         # 3) Potential-based shaping (does not change the optimal policy)
-        gamma = GAMMA_SHAPING
+        gamma = cfg.GAMMA_SHAPING
 
         old_g = self._grid_coords(old_x, old_y)
         new_g = self._grid_coords(new_x, new_y)
@@ -435,7 +498,7 @@ class Environment:
             old_dd = dist_dot[old_g[1], old_g[0]]
             new_dd = dist_dot[new_g[1], new_g[0]]
             if np.isfinite(old_dd) and np.isfinite(new_dd):
-                r += LAMBDA_DOT * (gamma * (-new_dd) - (-old_dd))
+                r += cfg.LAMBDA_DOT * (gamma * (-new_dd) - (-old_dd))
 
         # Away from the nearest enemy: Phi_enemy(s) = + dist_to_nearest_enemy_in_cells
         enemy_cells = self._enemy_cells()
@@ -444,10 +507,10 @@ class Environment:
             old_de = dist_enemy[old_g[1], old_g[0]]
             new_de = dist_enemy[new_g[1], new_g[0]]
             if np.isfinite(old_de) and np.isfinite(new_de):
-                r += LAMBDA_ENEMY * (gamma * (new_de) - (old_de))
+                r += cfg.LAMBDA_ENEMY * (gamma * (new_de) - (old_de))
                 # Optional: small penalty when adjacent to an enemy (1 cell away)
                 if new_de == 1:
-                    r += ADJ_ENEMY_PEN
+                    r += cfg.ADJ_ENEMY_PEN
 
         return float(r)
 
