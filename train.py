@@ -6,9 +6,11 @@ import argparse
 from config import (
     BASE_FEAT_DIM,
     INPUT_SIZE,
+    MODEL_TYPE,
     NUM_EPISODES,
     TARGET_UPDATE_FREQ,
     CHECKPOINT_DIR,
+    MEMORY_SAVE_EVERY_EPISODES,
     MAX_STEPS_PER_EPISODE,
     MAX_EPISODE_TIME,
     VISUALIZE_TRAINING,
@@ -34,6 +36,8 @@ def checkpoint_paths(checkpoint_dir):
     return {
         "latest_model": os.path.join(checkpoint_dir, "latest_model.pth"),
         "latest_meta": os.path.join(checkpoint_dir, "latest_meta.json"),
+        "best_model": os.path.join(checkpoint_dir, "best_model.pth"),
+        "best_meta": os.path.join(checkpoint_dir, "best_meta.json"),
         "full_template": os.path.join(checkpoint_dir, "policy_ep{ep}.pth"),
         "training_log": os.path.join(checkpoint_dir, "training_log.txt"),
         "eval_log": os.path.join(checkpoint_dir, "eval_log.tsv"),
@@ -115,9 +119,45 @@ def save_latest_checkpoint(paths, agent, episode, args):
             'epsilon': agent.epsilon,
             'reward_profile': args.reward_profile,
             'seed': args.seed,
+            'model_type': MODEL_TYPE,
             'base_feat_dim': BASE_FEAT_DIM,
             'input_size': INPUT_SIZE,
         }, meta_file)
+
+
+def eval_score(metrics):
+    return metrics["avg_dots"] - 0.5 * metrics["avg_wall_bumps"]
+
+
+def load_best_score(paths):
+    if not os.path.exists(paths["best_meta"]):
+        return None
+    try:
+        with open(paths["best_meta"], "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        if meta.get("input_size") != INPUT_SIZE or meta.get("model_type") != MODEL_TYPE:
+            return None
+        return meta.get("best_score")
+    except Exception as exc:
+        print(f"[best] failed to read best metadata: {exc}")
+        return None
+
+
+def save_best_checkpoint(paths, agent, episode, args, metrics, score):
+    agent.save(paths["best_model"], paths["memory"])
+    with open(paths["best_meta"], "w", encoding="utf-8") as f:
+        json.dump({
+            "episode": episode,
+            "epsilon": agent.epsilon,
+            "reward_profile": args.reward_profile,
+            "seed": args.seed,
+            "model_type": MODEL_TYPE,
+            "base_feat_dim": BASE_FEAT_DIM,
+            "input_size": INPUT_SIZE,
+            "best_score": score,
+            "score_formula": "avg_dots - 0.5 * avg_wall_bumps",
+            "metrics": metrics,
+        }, f, indent=2)
 
 
 def parse_args(argv=None):
@@ -139,7 +179,8 @@ def main(argv=None):
       - Resume from latest_model + metadata if present
       - Run episodes with optional step/time limits
       - Save rolling latest_model + metadata each episode
-      - Save replay memory and full snapshots every 100 episodes
+      - Save model snapshots every 100 episodes
+      - Save replay memory every MEMORY_SAVE_EVERY_EPISODES episodes
       - Append training summaries to training_log.txt every 50 episodes
     """
     args = parse_args(argv)
@@ -160,7 +201,7 @@ def main(argv=None):
     if os.path.exists(paths["latest_model"]) and os.path.exists(paths["latest_meta"]):
         with open(paths["latest_meta"], 'r') as f:
             meta = json.load(f)
-        if meta.get("input_size") == INPUT_SIZE:
+        if meta.get("input_size") == INPUT_SIZE and meta.get("model_type") == MODEL_TYPE:
             last_ep = meta.get('episode', 0)
             agent.epsilon = meta.get('epsilon', agent.epsilon)
             agent.load(paths["latest_model"])
@@ -168,7 +209,7 @@ def main(argv=None):
         else:
             can_load_memory = False
             print(
-                "[resume] checkpoint input_size is incompatible with current state encoding; "
+                "[resume] checkpoint model_type/input_size is incompatible with current config; "
                 "starting a fresh model in this checkpoint directory."
             )
 
@@ -193,6 +234,9 @@ def main(argv=None):
     episode_records = []
     last_completed_ep = last_ep
     current_partial_record = None
+    best_score = load_best_score(paths)
+    if best_score is not None:
+        print(f"[best] current best score: {best_score:.3f}")
 
     # Training loop
     try:
@@ -336,18 +380,26 @@ def main(argv=None):
                     seed=args.seed,
                 )
                 append_eval_log(paths["eval_log"], args.reward_profile, args.seed, ep, metrics)
+                score = eval_score(metrics)
+                if best_score is None or score > best_score:
+                    best_score = score
+                    save_best_checkpoint(paths, agent, ep, args, metrics, score)
+                    print(f"[Best {ep}] score={score:.3f} saved to {paths['best_model']}")
                 print(
                     f"[Eval {ep}] dots/100={metrics['dots_per_100_steps']:.2f}"
                     f" | walls/100={metrics['wall_bumps_per_100_steps']:.2f}"
                     f" | death_after_dots={metrics['avg_death_after_dots']:.2f}"
+                    f" | score={score:.2f}"
                 )
 
             # Save latest model and metadata.
             save_latest_checkpoint(paths, agent, ep, args)
 
-            # Full snapshot every 100 episodes
+            # Lightweight model snapshot every 100 episodes.
             if ep % 100 == 0:
                 agent.save(paths["full_template"].format(ep=ep), paths["memory"])
+
+            if MEMORY_SAVE_EVERY_EPISODES > 0 and ep % MEMORY_SAVE_EVERY_EPISODES == 0:
                 agent.save_memory(paths["memory"])
 
     except KeyboardInterrupt:

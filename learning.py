@@ -2,6 +2,13 @@ import random
 from replayMemory import ReplayMemory
 import torch
 import torch.nn as nn
+from config import (
+    GRID_W,
+    GRID_H,
+    K_FRAMES,
+    STATE_GRID_CHANNELS,
+    STATE_EXTRA_FEATURES,
+)
 
 train_step = 0  # Global counter for tracking updates
 losses = []  # Store loss history
@@ -105,6 +112,95 @@ class DuelingDQN(nn.Module):
         A = A - A.mean(dim=1, keepdim=True)    # mean 归一，解决不唯一性
         Q = V + A                              # (B, n_actions)
         return Q
+
+
+class DuelingCNN(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size):
+        super().__init__()
+        self.input_size = int(input_size)
+        self.k_frames = K_FRAMES
+        self.grid_w = GRID_W
+        self.grid_h = GRID_H
+        self.grid_channels = STATE_GRID_CHANNELS
+        self.extra_per_frame = 4 + STATE_EXTRA_FEATURES
+        self.grid_len = self.grid_w * self.grid_h * self.grid_channels
+        self.frame_dim = self.grid_len + self.extra_per_frame
+
+        expected_input = self.frame_dim * self.k_frames
+        if self.input_size != expected_input:
+            raise ValueError(
+                f"DuelingCNN expected input_size={expected_input}, got {self.input_size}"
+            )
+
+        self.conv = nn.Sequential(
+            nn.Conv2d(self.grid_channels * self.k_frames, 32, kernel_size=3, padding=1),
+            nn.LeakyReLU(negative_slope=0.01),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.LeakyReLU(negative_slope=0.01),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.LeakyReLU(negative_slope=0.01),
+            nn.Flatten(),
+        )
+
+        with torch.no_grad():
+            dummy = torch.zeros(1, self.grid_channels * self.k_frames, self.grid_h, self.grid_w)
+            conv_out = self.conv(dummy).shape[1]
+
+        self.shared = nn.Sequential(
+            nn.Linear(conv_out + self.extra_per_frame * self.k_frames, hidden_size),
+            nn.LeakyReLU(negative_slope=0.01),
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.LeakyReLU(negative_slope=0.01),
+        )
+
+        self.value_head = nn.Sequential(
+            nn.Linear(hidden_size // 2, hidden_size // 2),
+            nn.LeakyReLU(negative_slope=0.01),
+            nn.Linear(hidden_size // 2, 1)
+        )
+        self.adv_head = nn.Sequential(
+            nn.Linear(hidden_size // 2, hidden_size // 2),
+            nn.LeakyReLU(negative_slope=0.01),
+            nn.Linear(hidden_size // 2, output_size)
+        )
+
+        nn.init.zeros_(self.value_head[-1].weight)
+        nn.init.zeros_(self.value_head[-1].bias)
+        nn.init.zeros_(self.adv_head[-1].weight)
+        nn.init.zeros_(self.adv_head[-1].bias)
+
+    def _split_state(self, x):
+        x = x.view(x.shape[0], self.k_frames, self.frame_dim)
+        grid = x[:, :, :self.grid_len]
+        extra = x[:, :, self.grid_len:]
+
+        grid = grid.view(
+            x.shape[0],
+            self.k_frames,
+            self.grid_channels,
+            self.grid_w,
+            self.grid_h,
+        )
+        grid = grid.permute(0, 1, 2, 4, 3).contiguous()
+        grid = grid.view(
+            x.shape[0],
+            self.k_frames * self.grid_channels,
+            self.grid_h,
+            self.grid_w,
+        )
+        extra = extra.reshape(x.shape[0], self.k_frames * self.extra_per_frame)
+        return grid, extra
+
+    def forward(self, x):
+        grid, extra = self._split_state(x)
+        conv_features = self.conv(grid)
+        features = torch.cat((conv_features, extra), dim=1)
+        shared = self.shared(features)
+
+        V = self.value_head(shared)
+        A = self.adv_head(shared)
+        A = A - A.mean(dim=1, keepdim=True)
+        return V + A
 
 
 

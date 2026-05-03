@@ -3,12 +3,13 @@ from collections import deque
 import torch
 import pickle
 import numpy as np
-from learning import DQN, DuelingDQN, train_dqn, select_action as select_action_fn
+from learning import DQN, DuelingDQN, DuelingCNN, train_dqn, select_action as select_action_fn
 from replayMemory import ReplayMemory
 from config import (
     INPUT_SIZE,
     HIDDEN_SIZE,
     OUTPUT_SIZE,
+    MODEL_TYPE,
     MEMORY_CAPACITY,
     MEMORY_PATH,
     LR,
@@ -31,10 +32,11 @@ class Agent:
         # Device configuration
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print("Using device: {}".format(self.device))
+        self.model_type = MODEL_TYPE
 
         # Networks
-        self.policy_net = DuelingDQN(input_dim, HIDDEN_SIZE, output_dim).to(self.device)
-        self.target_net = DuelingDQN(input_dim, HIDDEN_SIZE, output_dim).to(self.device)
+        self.policy_net = self._build_network(input_dim, output_dim).to(self.device)
+        self.target_net = self._build_network(input_dim, output_dim).to(self.device)
         self.update_target()
 
         # Optimizer
@@ -53,6 +55,13 @@ class Agent:
 
         self.k = k_frames
         self.state_buf = deque(maxlen=self.k)
+
+    def _build_network(self, input_dim, output_dim):
+        if self.model_type == "cnn":
+            return DuelingCNN(input_dim, HIDDEN_SIZE, output_dim)
+        if self.model_type == "mlp":
+            return DuelingDQN(input_dim, HIDDEN_SIZE, output_dim)
+        raise ValueError(f"Unsupported MODEL_TYPE: {self.model_type}")
 
     def _stacked(self):
         assert len(self.state_buf) == self.k
@@ -179,9 +188,9 @@ class Agent:
             self.policy_net.load_state_dict(torch.load(path))
         except RuntimeError as exc:
             raise RuntimeError(
-                "Failed to load checkpoint. The model architecture or INPUT_SIZE "
-                "does not match the current state encoder; train a fresh checkpoint "
-                "or use the code version that created this checkpoint."
+                "Failed to load checkpoint. The model architecture, MODEL_TYPE, "
+                "or INPUT_SIZE does not match the current state encoder; train a "
+                "fresh checkpoint or use the code version that created this checkpoint."
             ) from exc
         self.update_target()
 
