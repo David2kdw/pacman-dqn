@@ -3,10 +3,12 @@ import pickle
 import time
 import json
 import argparse
+from collections import deque
 from config import (
     BASE_FEAT_DIM,
     INPUT_SIZE,
     MODEL_TYPE,
+    N_STEP_RETURN,
     NUM_EPISODES,
     TARGET_UPDATE_FREQ,
     CHECKPOINT_DIR,
@@ -27,7 +29,7 @@ LOG_EVERY_EPISODES = 50
 TRAINING_LOG_HEADER = (
     "timestamp\tepisodes\tcount\tavg_reward\tmin_reward\t"
     "max_reward\tavg_steps\tavg_duration_sec\tclear\tdeath\t"
-    "step_cap\ttime_cap\tinterrupted\twall_bumps\tdots_eaten\tepsilon\tmemory\ttrain_step\t"
+    "step_cap\ttime_cap\tinterrupted\twall_bumps\tdots_eaten\tepsilon\tlearning_rate\tmemory\ttrain_step\t"
     "latest_loss\tavg_loss_last100\tlatest_q\tavg_q_last100\n"
 )
 
@@ -49,7 +51,7 @@ def _avg(values):
     return sum(values) / len(values) if values else 0.0
 
 
-def append_training_log(path, episode_records, agent):
+def append_training_log(path, episode_records, agent, memory_size=None):
     """
     Append a compact rolling summary for the latest training window.
     """
@@ -78,7 +80,11 @@ def append_training_log(path, episode_records, agent):
     if not needs_header:
         with open(path, 'r', encoding='utf-8') as f:
             header = f.readline()
-            needs_header = "wall_bumps" not in header or "interrupted" not in header
+            needs_header = (
+                "wall_bumps" not in header
+                or "interrupted" not in header
+                or "learning_rate" not in header
+            )
 
     line = (
         f"{time.strftime('%Y-%m-%d %H:%M:%S')}\t"
@@ -97,7 +103,8 @@ def append_training_log(path, episode_records, agent):
         f"wall_bumps={wall_bumps}\t"
         f"dots_eaten={dots_eaten}\t"
         f"epsilon={agent.epsilon:.6f}\t"
-        f"memory={len(agent.memory)}\t"
+        f"learning_rate={agent.get_learning_rate():.8f}\t"
+        f"memory={len(agent.memory) if memory_size is None else memory_size}\t"
         f"train_step={learning.train_step}\t"
         f"latest_loss={latest_loss:.6f}\t"
         f"avg_loss_last100={_avg(recent_losses):.6f}\t"
@@ -117,9 +124,12 @@ def save_latest_checkpoint(paths, agent, episode, args):
         json.dump({
             'episode': episode,
             'epsilon': agent.epsilon,
+            'learning_rate': agent.get_learning_rate(),
             'reward_profile': args.reward_profile,
             'seed': args.seed,
+            'algo': args.algo,
             'model_type': MODEL_TYPE,
+            'n_step_return': N_STEP_RETURN,
             'base_feat_dim': BASE_FEAT_DIM,
             'input_size': INPUT_SIZE,
         }, meta_file)
@@ -129,13 +139,18 @@ def eval_score(metrics):
     return metrics["avg_dots"] - 0.5 * metrics["avg_wall_bumps"]
 
 
-def load_best_score(paths):
+def load_best_score(paths, args):
     if not os.path.exists(paths["best_meta"]):
         return None
     try:
         with open(paths["best_meta"], "r", encoding="utf-8") as f:
             meta = json.load(f)
-        if meta.get("input_size") != INPUT_SIZE or meta.get("model_type") != MODEL_TYPE:
+        if (
+            meta.get("input_size") != INPUT_SIZE
+            or meta.get("model_type") != MODEL_TYPE
+            or meta.get("n_step_return", 1) != N_STEP_RETURN
+            or meta.get("algo", "dqn") != args.algo
+        ):
             return None
         return meta.get("best_score")
     except Exception as exc:
@@ -149,9 +164,12 @@ def save_best_checkpoint(paths, agent, episode, args, metrics, score):
         json.dump({
             "episode": episode,
             "epsilon": agent.epsilon,
+            "learning_rate": agent.get_learning_rate(),
             "reward_profile": args.reward_profile,
             "seed": args.seed,
+            "algo": args.algo,
             "model_type": MODEL_TYPE,
+            "n_step_return": N_STEP_RETURN,
             "base_feat_dim": BASE_FEAT_DIM,
             "input_size": INPUT_SIZE,
             "best_score": score,
@@ -161,7 +179,8 @@ def save_best_checkpoint(paths, agent, episode, args, metrics, score):
 
 
 def parse_args(argv=None):
-    parser = argparse.ArgumentParser(description="Train Pac-Man DQN.")
+    parser = argparse.ArgumentParser(description="Train Pac-Man with DQN or on-policy SARSA.")
+    parser.add_argument("--algo", choices=("dqn", "sarsa"), default="dqn")
     parser.add_argument("--reward-profile", choices=sorted(REWARD_PROFILES), default="baseline")
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--checkpoint-dir", default=CHECKPOINT_DIR)
@@ -201,20 +220,31 @@ def main(argv=None):
     if os.path.exists(paths["latest_model"]) and os.path.exists(paths["latest_meta"]):
         with open(paths["latest_meta"], 'r') as f:
             meta = json.load(f)
-        if meta.get("input_size") == INPUT_SIZE and meta.get("model_type") == MODEL_TYPE:
+        if (
+            meta.get("input_size") == INPUT_SIZE
+            and meta.get("model_type") == MODEL_TYPE
+            and meta.get("n_step_return", 1) == N_STEP_RETURN
+            and meta.get("algo", "dqn") == args.algo
+        ):
             last_ep = meta.get('episode', 0)
             agent.epsilon = meta.get('epsilon', agent.epsilon)
+            agent.set_learning_rate(
+                meta.get('learning_rate', agent.scheduled_learning_rate(last_ep))
+            )
             agent.load(paths["latest_model"])
-            print(f"Resumed training from episode {last_ep}, epsilon={agent.epsilon:.3f}")
+            print(
+                f"Resumed training from episode {last_ep}, "
+                f"epsilon={agent.epsilon:.3f}, lr={agent.get_learning_rate():.6f}"
+            )
         else:
             can_load_memory = False
             print(
-                "[resume] checkpoint model_type/input_size is incompatible with current config; "
+                "[resume] checkpoint algo/model_type/input_size/n_step_return is incompatible with current config; "
                 "starting a fresh model in this checkpoint directory."
             )
 
-    # Load memory
-    if can_load_memory:
+    # Load replay memory only for DQN. On-policy SARSA intentionally does not use replay.
+    if args.algo == "dqn" and can_load_memory:
         try:
             with open(paths["memory"], "rb") as f:
                 loaded = pickle.load(f)
@@ -222,8 +252,11 @@ def main(argv=None):
                 print("Memory loaded")
         except Exception as e:
             print(f"[memory] failed to load: {e}")
-    else:
+    elif args.algo == "dqn":
         print("[memory] skipped incompatible replay memory")
+    else:
+        can_load_memory = False
+        print("[memory] skipped for on-policy SARSA")
 
 
     start_ep = last_ep + 1
@@ -234,7 +267,7 @@ def main(argv=None):
     episode_records = []
     last_completed_ep = last_ep
     current_partial_record = None
-    best_score = load_best_score(paths)
+    best_score = load_best_score(paths, args)
     if best_score is not None:
         print(f"[best] current best score: {best_score:.3f}")
 
@@ -267,6 +300,9 @@ def main(argv=None):
                                        'reward': total_reward,
                                        'epsilon': agent.epsilon})
 
+            sarsa_buffer = deque()
+            action = agent.select_action(state) if args.algo == "sarsa" else None
+
             # Loop until terminal, step limit, or time limit
             while (not done
                    and step < args.max_steps
@@ -295,7 +331,8 @@ def main(argv=None):
                     continue   # back to top of while, still paused
             
 
-                action = agent.select_action()
+                if args.algo == "dqn":
+                    action = agent.select_action()
                 s, a, r, s_next, done = agent.step(env, action)
                 last_event = getattr(env, "last_event", {})
                 if last_event.get("wall_bump"):
@@ -321,8 +358,30 @@ def main(argv=None):
                         end_reason = 'time limit reached'
                         r += env.reward_config.R_TIMEOUT
 
-                agent.store_transition(s, a, r, s_next, done)
-                agent.optimize_model()
+                if args.algo == "dqn":
+                    agent.store_transition(s, a, r, s_next, done)
+                    agent.optimize_model()
+                else:
+                    next_action = None if done else agent.select_action(s_next)
+                    sarsa_buffer.append((s, a, r, s_next, next_action, done))
+                    if len(sarsa_buffer) >= N_STEP_RETURN:
+                        learning.train_sarsa_n_step(
+                            agent.policy_net,
+                            agent.target_net,
+                            agent.optimizer,
+                            list(sarsa_buffer)[:N_STEP_RETURN],
+                        )
+                        sarsa_buffer.popleft()
+                    if done:
+                        while sarsa_buffer:
+                            learning.train_sarsa_n_step(
+                                agent.policy_net,
+                                agent.target_net,
+                                agent.optimizer,
+                                list(sarsa_buffer),
+                            )
+                            sarsa_buffer.popleft()
+                    action = next_action
                 total_reward += r
                 state = s_next
 
@@ -347,13 +406,15 @@ def main(argv=None):
 
             # Episode-end updates
             agent.decay_epsilon()
+            agent.decay_learning_rate()
             if ep % TARGET_UPDATE_FREQ == 0:
                 agent.update_target()
 
             print(f"Episode {ep}/{args.episodes}"
                   f" | Steps: {step}"
                   f" | Reward: {total_reward:.2f}"
-                  f" | Epsilon: {agent.epsilon:.3f}")
+                  f" | Epsilon: {agent.epsilon:.3f}"
+                  f" | LR: {agent.get_learning_rate():.6f}")
 
             episode_records.append({
                 'episode': ep,
@@ -367,8 +428,14 @@ def main(argv=None):
             last_completed_ep = ep
             current_partial_record = None
 
+            log_memory_size = 0 if args.algo == "sarsa" else None
             if ep % LOG_EVERY_EPISODES == 0:
-                append_training_log(paths["training_log"], episode_records[-LOG_EVERY_EPISODES:], agent)
+                append_training_log(
+                    paths["training_log"],
+                    episode_records[-LOG_EVERY_EPISODES:],
+                    agent,
+                    memory_size=log_memory_size,
+                )
 
             if args.eval_every > 0 and ep % args.eval_every == 0:
                 metrics = run_greedy_eval(
@@ -399,25 +466,55 @@ def main(argv=None):
             if ep % 100 == 0:
                 agent.save(paths["full_template"].format(ep=ep), paths["memory"])
 
-            if MEMORY_SAVE_EVERY_EPISODES > 0 and ep % MEMORY_SAVE_EVERY_EPISODES == 0:
+            if (
+                args.algo == "dqn"
+                and MEMORY_SAVE_EVERY_EPISODES > 0
+                and ep % MEMORY_SAVE_EVERY_EPISODES == 0
+            ):
                 agent.save_memory(paths["memory"])
 
+        unwritten = len(episode_records) % LOG_EVERY_EPISODES
+        if unwritten:
+            append_training_log(
+                paths["training_log"],
+                episode_records[-unwritten:],
+                agent,
+                memory_size=0 if args.algo == "sarsa" else None,
+            )
+
     except KeyboardInterrupt:
-        print("\nInterrupted. Saving latest checkpoint and replay memory...")
+        print("\nInterrupted. Saving latest checkpoint...")
         if last_completed_ep > 0:
             save_latest_checkpoint(paths, agent, last_completed_ep, args)
-            agent.save_memory(paths["memory"])
+            if args.algo == "dqn":
+                agent.save_memory(paths["memory"])
             unwritten = len(episode_records) % LOG_EVERY_EPISODES
             if unwritten:
-                append_training_log(paths["training_log"], episode_records[-unwritten:], agent)
+                append_training_log(
+                    paths["training_log"],
+                    episode_records[-unwritten:],
+                    agent,
+                    memory_size=0 if args.algo == "sarsa" else None,
+                )
             if current_partial_record is not None and current_partial_record.get('steps', 0) > 0:
-                append_training_log(paths["training_log"], [current_partial_record], agent)
+                append_training_log(
+                    paths["training_log"],
+                    [current_partial_record],
+                    agent,
+                    memory_size=0 if args.algo == "sarsa" else None,
+                )
             print(f"Saved interrupt checkpoint at episode {last_completed_ep}.")
         else:
-            agent.save_memory(paths["memory"])
+            if args.algo == "dqn":
+                agent.save_memory(paths["memory"])
             if current_partial_record is not None and current_partial_record.get('steps', 0) > 0:
-                append_training_log(paths["training_log"], [current_partial_record], agent)
-            print("Saved replay memory, but no completed episode was available for metadata.")
+                append_training_log(
+                    paths["training_log"],
+                    [current_partial_record],
+                    agent,
+                    memory_size=0 if args.algo == "sarsa" else None,
+                )
+            print("Saved interrupt state, but no completed episode was available for metadata.")
         if renderer is not None:
             pygame.quit()
         return

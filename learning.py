@@ -17,27 +17,29 @@ q_value_logs = []  # Store Q-value history
 
 def _unpack_transition_batch(batch):
     """
-    Support both normal 5-field replay items and older 6-field items.
-    Any stored legacy metadata is ignored.
+    Support old 1-step replay items and newer n-step replay items.
     """
     states = []
     actions = []
     rewards = []
     next_states = []
     dones = []
+    discounts = []
 
     for item in batch:
         if len(item) == 6:
-            s, a, r, s_next, _ignored_metadata, done = item
+            s, a, r, s_next, discount, done = item
         else:
             s, a, r, s_next, done = item
+            discount = None
         states.append(s)
         actions.append(a)
         rewards.append(r)
         next_states.append(s_next)
         dones.append(done)
+        discounts.append(discount)
 
-    return states, actions, rewards, next_states, dones
+    return states, actions, rewards, next_states, dones, discounts
 
 class DQN(nn.Module):
     def __init__(self, input_size, hidden_size, output_size):
@@ -231,17 +233,24 @@ def train_dqn(
 
     # 2) Sample from replay
     batch, indices, weights = memory.sample(batch_size, beta=beta)
-    states, actions, rewards, next_states, dones = _unpack_transition_batch(batch)
+    states, actions, rewards, next_states, dones, discounts = _unpack_transition_batch(batch)
 
     states = torch.cat(states, dim=0)
     next_states = torch.cat(next_states, dim=0)
     actions = torch.as_tensor(actions, dtype=torch.long)
     rewards = torch.as_tensor(rewards, dtype=torch.float32)
     dones = torch.as_tensor(dones, dtype=torch.bool)
+    discounts = torch.as_tensor(
+        [gamma if d is None else float(d) for d in discounts],
+        dtype=torch.float32,
+    )
 
     device = next(online_model.parameters()).device
     states, next_states = states.to(device), next_states.to(device)
-    actions, rewards, dones = actions.to(device), rewards.to(device), dones.to(device)
+    actions = actions.to(device)
+    rewards = rewards.to(device)
+    dones = dones.to(device)
+    discounts = discounts.to(device)
     weights = weights.to(device)
 
     # 3) Q(s,a) for actions taken
@@ -254,7 +263,7 @@ def train_dqn(
         target_model.eval()
         next_actions = online_model(next_states).argmax(dim=1, keepdim=True)
         next_target_q = target_model(next_states).gather(1, next_actions).squeeze(1)
-        target_q_values = rewards + gamma * next_target_q * (~dones)
+        target_q_values = rewards + discounts * next_target_q * (~dones)
     online_model.train(online_mode)
     target_model.train(target_mode)
 
@@ -283,22 +292,125 @@ def train_dqn(
         import numpy as _np
         last = slice(-100, None)
         n_term = int(dones.sum().item())
-        print(f"\n🔹 TRAINING UPDATE {train_step}")
-        print(f"   ✅ Average Loss (Last 100): {_np.mean(losses[last]):.5f}")
-        print(f"   ✅ Average Q: {_np.mean(q_value_logs[last]):.3f} "
-              f"(Min: {_np.min(q_value_logs[last]):.3f}, Max: {_np.max(q_value_logs[last]):.3f})")
-        print(f"   ✅ Termination Samples in batch: {n_term}")
+        q_np = q_values.detach().cpu().numpy()
+        target_np = target_q_values.detach().cpu().numpy()
+        td_np = td_errors
+        reward_np = rewards.detach().cpu().numpy()
+        bootstrap_np = next_target_q.detach().cpu().numpy()
+        action_counts = torch.bincount(actions.detach().cpu(), minlength=4).tolist()
+        latest_loss = losses[-1]
+        avg_loss = _np.mean(losses[last])
 
-        # Debug examples (one ongoing and one terminal if present)
-        if n_term < batch_size:
-            # pick a non-terminal
-            idx = int((~dones).nonzero(as_tuple=True)[0][0].item())
-            print(f"   ✅ Ongoing Sample: Q={q_values[idx].item():.3f} | "
-                  f"T={target_q_values[idx].item():.3f}")
-        if n_term > 0:
-            idx = int(dones.nonzero(as_tuple=True)[0][0].item())
-            print(f"   ❌ Terminal Sample: Q={q_values[idx].item():.3f} | "
-                  f"T={target_q_values[idx].item():.3f}")
+        print(f"\n🔹 DQN UPDATE {train_step} | loss={latest_loss:.5f} avg100={avg_loss:.5f}")
+        print(
+            f"   Q taken mean/min/max: "
+            f"{_np.mean(q_np):.3f} / {_np.min(q_np):.3f} / {_np.max(q_np):.3f}"
+        )
+        print(
+            f"   Target mean/min/max: "
+            f"{_np.mean(target_np):.3f} / {_np.min(target_np):.3f} / {_np.max(target_np):.3f}"
+        )
+        print(
+            f"   TD error mean/p95/max: "
+            f"{_np.mean(td_np):.3f} / {_np.percentile(td_np, 95):.3f} / {_np.max(td_np):.3f}"
+        )
+        print(
+            f"   Reward mean/min/max: "
+            f"{_np.mean(reward_np):.3f} / {_np.min(reward_np):.3f} / {_np.max(reward_np):.3f}"
+        )
+        print(
+            f"   Bootstrap Q mean/max: "
+            f"{_np.mean(bootstrap_np):.3f} / {_np.max(bootstrap_np):.3f}"
+        )
+        print(f"   Batch terminal={n_term}/{batch_size} | actions={action_counts}")
+        print('-' * 50)
+
+
+def train_sarsa_n_step(
+    policy_model: nn.Module,
+    target_model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    transitions,
+    gamma: float = 0.99,
+    max_grad_norm: float | None = 5.0,
+) -> None:
+    """
+    One on-policy n-step Deep SARSA update.
+
+    `transitions` is an ordered episode-local sequence of
+    (state, action, reward, next_state, next_action, done).
+    The bootstrap action must be the action actually selected by the behavior
+    policy, not an argmax computed during training.
+    """
+    global train_step, losses, q_value_logs
+
+    if not transitions:
+        return
+
+    state, action, _, _, _, _ = transitions[0]
+    reward_sum = 0.0
+    bootstrap_state = None
+    bootstrap_action = None
+    terminal = False
+    horizon = 0
+
+    for i, (_, _, reward, next_state, next_action, done) in enumerate(transitions):
+        reward_sum += (gamma ** i) * float(reward)
+        bootstrap_state = next_state
+        bootstrap_action = next_action
+        terminal = bool(done)
+        horizon = i + 1
+        if terminal:
+            break
+
+    device = next(policy_model.parameters()).device
+    state = state.to(device)
+    action_tensor = torch.as_tensor([action], dtype=torch.long, device=device)
+    target_value = torch.as_tensor([reward_sum], dtype=torch.float32, device=device)
+
+    policy_mode, target_mode = policy_model.training, target_model.training
+    with torch.no_grad():
+        target_model.eval()
+        if not terminal and bootstrap_state is not None and bootstrap_action is not None:
+            bootstrap_state = bootstrap_state.to(device)
+            bootstrap_action_tensor = torch.as_tensor(
+                [[bootstrap_action]], dtype=torch.long, device=device
+            )
+            bootstrap_q = target_model(bootstrap_state).gather(1, bootstrap_action_tensor).squeeze(1)
+            target_value = target_value + (gamma ** horizon) * bootstrap_q
+    target_model.train(target_mode)
+
+    policy_model.train(policy_mode)
+    q_value = policy_model(state).gather(1, action_tensor.view(1, 1)).squeeze(1)
+
+    loss_fn = nn.SmoothL1Loss()
+    loss = loss_fn(q_value, target_value)
+
+    optimizer.zero_grad(set_to_none=True)
+    loss.backward()
+    if max_grad_norm is not None:
+        nn.utils.clip_grad_norm_(policy_model.parameters(), max_grad_norm)
+    optimizer.step()
+
+    losses.append(loss.item())
+    q_value_logs.append(q_value.mean().item())
+    train_step += 1
+
+    if train_step % 100 == 0:
+        import numpy as _np
+        last = slice(-100, None)
+        print(f"\n🔹 SARSA UPDATE {train_step}")
+        print(f"   loss={loss.item():.5f} avg100={_np.mean(losses[last]):.5f}")
+        print(
+            f"   Q avg100/min/max: {_np.mean(q_value_logs[last]):.3f} / "
+            f"{_np.min(q_value_logs[last]):.3f} / {_np.max(q_value_logs[last]):.3f}"
+        )
+        print(
+            f"   Current sample: Q={q_value.item():.3f} | "
+            f"target={target_value.item():.3f} | "
+            f"td_error={abs(q_value.item() - target_value.item()):.3f}"
+        )
+        print(f"   Horizon={horizon} | Terminal={terminal} | Action={action}")
         print('-' * 50)
 
 def select_action(model, state, epsilon):

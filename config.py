@@ -31,8 +31,12 @@ HEIGHT = len(_rows)    * GRID_SIZE
 del _rows
 
 # RL params
-LR      = 0.0003
+LR      = 0.0005
+LR_MIN = 0.0001
+LR_DECAY_EPISODES = 5000
+LR_DECAY = (LR_MIN / LR) ** (1 / LR_DECAY_EPISODES)
 GAMMA   = 0.99
+N_STEP_RETURN = 1
 NUM_EPISODES = 10000
 TARGET_UPDATE_FREQ = 10
 HIDDEN_SIZE = 256
@@ -93,6 +97,18 @@ REWARD_PROFILES = {
         "LAMBDA_DOT": 0.05,
         "LAMBDA_ENEMY": 0.10,
         "ADJ_ENEMY_PEN": -3.0,
+    },
+    "survival_cnn": {
+        "R_DEATH": -40.0,
+        "R_CLEAR": 25.0,
+        "R_TIMEOUT": -1.0,
+        "R_DOT": 1.0,
+        "LIVING_COST": -0.002,
+        "WALL_BUMP": -1.2,
+        "GAMMA_SHAPING": 0.99,
+        "LAMBDA_DOT": 0.04,
+        "LAMBDA_ENEMY": 0.14,
+        "ADJ_ENEMY_PEN": -5.0,
     },
     "balanced": {
         "R_DEATH": -20.0,

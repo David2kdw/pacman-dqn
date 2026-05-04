@@ -55,13 +55,24 @@ class ReplayMemory:
         reward: float,
         next_state: torch.Tensor,
         done: bool,
+        bootstrap_discount: Optional[float] = None,
         priority_override: Optional[float] = None,
     ) -> None:
         """
         Insert a transition. If `priority_override` is None, the new item will receive
         the current maximum priority (or 1.0 if buffer is empty).
         """
-        self.storage[self.next_idx] = (state, action, reward, next_state, done)
+        if bootstrap_discount is None:
+            self.storage[self.next_idx] = (state, action, reward, next_state, done)
+        else:
+            self.storage[self.next_idx] = (
+                state,
+                action,
+                reward,
+                next_state,
+                float(bootstrap_discount),
+                done,
+            )
 
         if priority_override is None:
             max_pr = self.priorities[:self.size].max() if self.size > 0 else 1.0

@@ -13,7 +13,10 @@ from config import (
     MEMORY_CAPACITY,
     MEMORY_PATH,
     LR,
+    LR_MIN,
+    LR_DECAY,
     GAMMA,
+    N_STEP_RETURN,
     BATCH_SIZE,
     EPSILON_START,
     EPSILON_DECAY,
@@ -46,6 +49,8 @@ class Agent:
 
         # Replay memory
         self.memory = ReplayMemory(MEMORY_CAPACITY, min_terminal_samples=5)
+        self.n_step = max(1, int(N_STEP_RETURN))
+        self.n_step_buffer = deque()
 
         # Epsilon-greedy parameters
         self.epsilon = EPSILON_START
@@ -77,6 +82,7 @@ class Agent:
         if s0.dim() == 1:
             s0 = s0.unsqueeze(0)
         self.state_buf.clear()
+        self.n_step_buffer.clear()
         for _ in range(self.k):
             self.state_buf.append(s0.clone())
         return self._stacked()
@@ -122,7 +128,39 @@ class Agent:
         Save a transition into replay memory.
 
         """
-        self.memory.push(*args)
+        state, action, reward, next_state, done = args
+        self.n_step_buffer.append((state, action, reward, next_state, done))
+
+        if self.n_step == 1:
+            self.memory.push(state, action, reward, next_state, done)
+            self.n_step_buffer.clear()
+            return
+
+        if len(self.n_step_buffer) >= self.n_step:
+            self._push_n_step_transition(self.n_step)
+
+        if done:
+            while self.n_step_buffer:
+                self._push_n_step_transition(len(self.n_step_buffer))
+
+    def _push_n_step_transition(self, horizon):
+        reward_sum = 0.0
+        next_state = None
+        done = False
+
+        for i, (_, _, reward, candidate_next_state, candidate_done) in enumerate(
+            list(self.n_step_buffer)[:horizon]
+        ):
+            reward_sum += (GAMMA ** i) * float(reward)
+            next_state = candidate_next_state
+            done = bool(candidate_done)
+            if done:
+                break
+
+        state, action, _, _, _ = self.n_step_buffer[0]
+        bootstrap_discount = GAMMA ** horizon
+        self.memory.push(state, action, reward_sum, next_state, done, bootstrap_discount)
+        self.n_step_buffer.popleft()
 
     def select_action(self, state=None):
         """
@@ -160,6 +198,21 @@ class Agent:
         Decay epsilon after each episode to reduce exploration over time.
         """
         self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
+
+    def get_learning_rate(self):
+        return self.optimizer.param_groups[0]["lr"]
+
+    def set_learning_rate(self, learning_rate):
+        lr = float(learning_rate)
+        for group in self.optimizer.param_groups:
+            group["lr"] = lr
+
+    def scheduled_learning_rate(self, completed_episodes):
+        lr = LR * (LR_DECAY ** max(0, int(completed_episodes)))
+        return max(LR_MIN, lr)
+
+    def decay_learning_rate(self):
+        self.set_learning_rate(max(LR_MIN, self.get_learning_rate() * LR_DECAY))
 
     def save(self, model_path: str, memory_path: str):
         """
